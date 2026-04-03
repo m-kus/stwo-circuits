@@ -2376,6 +2376,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlkem"
+version = "0.1.0"
+dependencies = [
+ "circuit-air",
+ "circuit-common",
+ "circuit-prover",
+ "circuit-serialize",
+ "circuits",
+ "circuits-stark-verifier",
+ "expect-test",
+ "itertools 0.12.1",
+ "num-traits",
+ "stwo",
+]
+
+[[package]]
 name = "munge"
 version = "0.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

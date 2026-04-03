@@ -1,0 +1,18 @@
+[package]
+name = "mlkem"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+circuits = { path = "../circuits" }
+itertools.workspace = true
+num-traits.workspace = true
+stwo.workspace = true
+
+[dev-dependencies]
+circuit-air = { path = "../circuit_air" }
+circuit-common = { path = "../circuit_common" }
+circuit-prover = { path = "../circuit_prover" }
+circuit-serialize = { path = "../circuit_serialize" }
+circuits-stark-verifier = { path = "../stark_verifier" }
+expect-test.workspace = true
