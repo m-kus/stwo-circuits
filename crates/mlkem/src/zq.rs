@@ -124,8 +124,19 @@ pub fn zq_witness<V: IValue + ZqWitness>(ctx: &mut Context<V>, value: u32) -> Zq
 /// Multiply two ZqVars: a, b in [0, 2Q), product in [0, 4Q^2) < 2^26.
 /// Returns a reduced value in [0, Q).
 pub fn zq_mul<V: IValue + ZqWitness>(ctx: &mut Context<V>, a: ZqVar, b: ZqVar) -> ZqVar {
+    zq_mul_ex(ctx, a, b, 26)
+}
+
+/// Like `zq_mul` but with configurable input_bits for the product.
+/// Use when inputs may be larger than [0, 2Q).
+pub fn zq_mul_ex<V: IValue + ZqWitness>(
+    ctx: &mut Context<V>,
+    a: ZqVar,
+    b: ZqVar,
+    input_bits: u32,
+) -> ZqVar {
     let prod = pointwise_mul(ctx, a.0, b.0);
-    mod_reduce_lazy(ctx, prod, 26)
+    mod_reduce_lazy(ctx, prod, input_bits)
 }
 
 /// Add two ZqVars: a, b in [0, 2Q), sum in [0, 4Q) < 2^14.
@@ -140,19 +151,58 @@ pub fn zq_add<V: IValue>(ctx: &mut Context<V>, a: ZqVar, b: ZqVar) -> ZqVar {
 /// Adds 2Q offset to ensure non-negative, then reduces.
 /// Result in [0, Q).
 pub fn zq_sub<V: IValue + ZqWitness>(ctx: &mut Context<V>, a: ZqVar, b: ZqVar) -> ZqVar {
-    let offset = ctx.constant(QM31::from(M31::from(2 * Q)));
-    let diff = eval!(ctx, ((a.0) + (offset)) - (b.0));
-    // diff in [0, 4Q) < 2^14
-    mod_reduce_lazy(ctx, diff, 14)
+    zq_sub_ex(ctx, a, b, 2 * Q, 14)
+}
+
+/// Like `zq_sub` but with configurable offset and input_bits.
+/// Use when `a` may be larger than [0, 2Q) (e.g., after unreduced NTT adds).
+/// offset must be >= max(b) to prevent underflow. result = a + offset - b.
+/// input_bits covers the range [0, max(a) + offset).
+pub fn zq_sub_ex<V: IValue + ZqWitness>(
+    ctx: &mut Context<V>,
+    a: ZqVar,
+    b: ZqVar,
+    offset: u32,
+    input_bits: u32,
+) -> ZqVar {
+    let offset_const = ctx.constant(QM31::from(M31::from(offset)));
+    let diff = eval!(ctx, ((a.0) + (offset_const)) - (b.0));
+    mod_reduce_lazy(ctx, diff, input_bits)
 }
 
 /// Multiply a ZqVar by a constant twiddle factor c in [0, Q).
 /// a in [0, 2Q), c < Q, product < 2Q^2 < 2^25.
 pub fn zq_mul_const<V: IValue + ZqWitness>(ctx: &mut Context<V>, a: ZqVar, c: u32) -> ZqVar {
-    assert!(c < Q, "zq_mul_const: twiddle {c} >= Q");
+    zq_mul_const_ex(ctx, a, c, 25)
+}
+
+/// Like `zq_mul_const` but with configurable `input_bits` for the product range.
+/// Use when the input `a` may be larger than [0, 2Q) (e.g., after accumulated unreduced adds).
+/// a < 2^a_bits, c < Q, product < 2^a_bits * Q. Caller must ensure product < P.
+pub fn zq_mul_const_ex<V: IValue + ZqWitness>(
+    ctx: &mut Context<V>,
+    a: ZqVar,
+    c: u32,
+    input_bits: u32,
+) -> ZqVar {
+    assert!(c < Q, "zq_mul_const_ex: twiddle {c} >= Q");
     let c_var = ctx.constant(QM31::from(M31::from(c)));
     let prod = pointwise_mul(ctx, a.0, c_var);
-    mod_reduce_lazy(ctx, prod, 25)
+    mod_reduce_lazy(ctx, prod, input_bits)
+}
+
+/// Create 4 ZqVars from witness values in [0, Q) with a single batched 13-bit range check.
+pub fn zq_witness_batch4<V: IValue + ZqWitness>(ctx: &mut Context<V>, values: [u32; 4]) -> [ZqVar; 4] {
+    for v in &values {
+        assert!(*v < Q, "zq_witness_batch4: value {v} >= Q");
+    }
+    let vars: [Var; 4] =
+        values.map(|v| guess(ctx, V::from_qm31(QM31::from(M31::from(v)))));
+    let wrapped: Vec<M31Wrapper<Var>> =
+        vars.iter().map(|v| M31Wrapper::new_unsafe(*v)).collect();
+    let simd = Simd::pack(ctx, &wrapped);
+    let _bits = extract_bits(ctx, &simd, 13);
+    vars.map(ZqVar)
 }
 
 /// Strict reduction: bring a ZqVar from [0, 2Q) to [0, Q).

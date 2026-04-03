@@ -2,6 +2,7 @@ use circuits::context::Context;
 use circuits::ivalue::IValue;
 
 use crate::constants::N;
+use crate::constants::Q;
 use crate::ntt::{RqPoly, inv_ntt, ntt, ntt_pointwise_mul};
 use crate::zq::{ZqWitness, zq_add, zq_sub};
 
@@ -34,12 +35,13 @@ pub fn poly_sub<V: IValue + ZqWitness>(
 }
 
 /// Multiply two polynomials in NTT domain (both must already be NTT-transformed).
+/// Assumes both have coefficients up to 8Q (from optimized NTT with unreduced adds).
 pub fn poly_pointwise_mul<V: IValue + ZqWitness>(
     ctx: &mut Context<V>,
     a: &RqPoly,
     b: &RqPoly,
 ) -> RqPoly {
-    ntt_pointwise_mul(ctx, a, b)
+    ntt_pointwise_mul(ctx, a, b, 8 * Q, 8 * Q)
 }
 
 /// Full polynomial multiplication: NTT → pointwise → INTT.
@@ -53,7 +55,8 @@ pub fn poly_mul<V: IValue + ZqWitness>(
     let mut b_ntt = b.clone();
     ntt(ctx, &mut a_ntt);
     ntt(ctx, &mut b_ntt);
-    let mut result = ntt_pointwise_mul(ctx, &a_ntt, &b_ntt);
+    let ntt_max = 8 * Q;
+    let mut result = ntt_pointwise_mul(ctx, &a_ntt, &b_ntt, ntt_max, ntt_max);
     inv_ntt(ctx, &mut result);
     result
 }
@@ -69,9 +72,10 @@ pub fn inner_product_ntt<V: IValue + ZqWitness>(
     assert_eq!(a.len(), b.len());
     assert!(!a.is_empty());
 
-    let mut acc = ntt_pointwise_mul(ctx, &a[0], &b[0]);
+    let ntt_max = 8 * Q;
+    let mut acc = ntt_pointwise_mul(ctx, &a[0], &b[0], ntt_max, ntt_max);
     for i in 1..a.len() {
-        let prod = ntt_pointwise_mul(ctx, &a[i], &b[i]);
+        let prod = ntt_pointwise_mul(ctx, &a[i], &b[i], ntt_max, ntt_max);
         acc = poly_add(ctx, &acc, &prod);
     }
     acc

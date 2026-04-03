@@ -212,7 +212,8 @@ fn test_pointwise_mul() {
     let a_poly = make_poly(&mut ctx, &a_ntt);
     let b_poly = make_poly(&mut ctx, &b_ntt);
 
-    let result = ntt_pointwise_mul(&mut ctx, &a_poly, &b_poly);
+    // Input polys were created via make_poly (values < Q), so max = Q
+    let result = ntt_pointwise_mul(&mut ctx, &a_poly, &b_poly, Q, Q);
     let result_vals = extract_vals(&ctx, &result);
 
     // Compute reference: multiply in coefficient domain, then NTT
