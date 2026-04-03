@@ -8,6 +8,7 @@ members = [
     "crates/circuit_prover",
     "crates/stark_verifier",
     "crates/stark_verifier_examples",
+    "crates/mlkem",
 ]
 resolver = "2"
 
