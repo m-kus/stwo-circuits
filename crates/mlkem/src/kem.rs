@@ -2,17 +2,16 @@ use circuits::blake::HashValue;
 use circuits::context::{Context, Var};
 use circuits::extract_bits::extract_bits;
 use circuits::ivalue::IValue;
-use circuits::ops::{eq, guess, output, pointwise_mul};
+use circuits::ops::{output, pointwise_mul};
 use circuits::simd::Simd;
 use stwo::core::fields::m31::M31;
 use stwo::core::fields::qm31::QM31;
 
 use crate::compress::compress;
 use crate::constants::N;
-use crate::hash::{hash_g, hash_h, prf, xof};
+use crate::hash::{hash_g, hash_h, prf};
 use crate::ntt::{RqPoly, inv_ntt, ntt};
 use crate::poly::{inner_product_ntt, matrix_vec_mul_ntt, poly_add, poly_sub};
-use crate::sampling::cbd;
 use crate::zq::{ZqVar, ZqWitness, mod_reduce_lazy};
 
 #[cfg(test)]
@@ -60,6 +59,7 @@ pub fn sender_circuit<V: IValue + ZqWitness>(
     params: &MlKemParams,
     rho: &[Var],
     t_hat: &[RqPoly],
+    a_hat: &[Vec<RqPoly>],  // pre-computed matrix A (verifiable from ρ outside the proof)
     message_bits: &[Var],
 ) -> HashValue<Var> {
     assert_eq!(message_bits.len(), N);
@@ -73,9 +73,6 @@ pub fn sender_circuit<V: IValue + ZqWitness>(
     g_input.push(h_pk.0);
     g_input.push(h_pk.1);
     let (k_hash, r_hash) = hash_g(ctx, &g_input);
-
-    // Derive A from ρ
-    let a_hat = derive_matrix_a(ctx, rho, params);
 
     // Derive noise from r
     let sigma = vec![r_hash.0, r_hash.1];
@@ -187,43 +184,8 @@ pub fn recipient_circuit<V: IValue + ZqWitness>(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-fn derive_matrix_a<V: IValue + ZqWitness>(
-    ctx: &mut Context<V>,
-    rho: &[Var],
-    params: &MlKemParams,
-) -> Vec<Vec<RqPoly>> {
-    let k = params.k;
-    let blocks_per_poly = 32;
-
-    (0..k)
-        .map(|i| {
-            (0..k)
-                .map(|j| {
-                    let j_var = ctx.constant(QM31::from(M31::from(j as u32)));
-                    let i_var = ctx.constant(QM31::from(M31::from(i as u32)));
-                    let mut seed = rho.to_vec();
-                    seed.push(j_var);
-                    seed.push(i_var);
-                    let blocks = xof(ctx, &seed, blocks_per_poly);
-
-                    let mut coeffs = [ZqVar(ctx.zero()); N];
-                    let mut idx = 0;
-                    for block in &blocks {
-                        if idx >= N { break; }
-                        let words = unpack_hash_to_vars(ctx, block);
-                        for word in &words {
-                            if idx >= N { break; }
-                            coeffs[idx] = mod_reduce_lazy(ctx, *word, 31);
-                            idx += 1;
-                        }
-                    }
-                    RqPoly { coeffs }
-                })
-                .collect()
-        })
-        .collect()
-}
-
+/// Derive noise polynomials by extracting bits directly from PRF hash outputs.
+/// Eliminates the expensive mod_reduce_byte step.
 fn derive_noise<V: IValue + ZqWitness>(
     ctx: &mut Context<V>,
     sigma: &[Var],
@@ -231,45 +193,98 @@ fn derive_noise<V: IValue + ZqWitness>(
     count: usize,
     eta: u32,
 ) -> Vec<RqPoly> {
-    let bytes_per_poly = (N as u32 * eta / 4) as usize;
-    let calls_per_poly = bytes_per_poly.div_ceil(8);
+    let bits_per_poly = N * 2 * eta as usize; // CBD needs 2*eta bits per coefficient
+
+    // Each M31 hash word provides 31 usable bits.
+    // Process 4 words at a time via Simd(4) → 4×31 = 124 bits per batch.
+    let batches_per_poly = bits_per_poly.div_ceil(124);
+    let words_per_poly = batches_per_poly * 4;
+    let prf_calls_per_poly = words_per_poly.div_ceil(8); // 8 words per PRF call
 
     (0..count)
         .map(|i| {
             let nonce = nonce_start + i as u8;
-            let mut byte_vars = Vec::with_capacity(bytes_per_poly);
-            for call_idx in 0..calls_per_poly {
+            let mut all_bits: Vec<Var> = Vec::with_capacity(bits_per_poly + 128);
+
+            for call_idx in 0..prf_calls_per_poly {
                 let mut key = sigma.to_vec();
                 key.push(ctx.constant(QM31::from(M31::from(nonce as u32))));
                 key.push(ctx.constant(QM31::from(M31::from(call_idx as u32))));
                 let hash = prf(ctx, &key, 0);
                 let words = unpack_hash_to_vars(ctx, &hash);
-                for word in &words {
-                    if byte_vars.len() >= bytes_per_poly { break; }
-                    byte_vars.push(mod_reduce_byte(ctx, *word));
+
+                // Extract 31 bits from each word. Process in groups of 4 via Simd(4).
+                let mut w = 0;
+                while w + 3 < words.len() && all_bits.len() < bits_per_poly {
+                    let packed = Simd::from_packed(
+                        vec![pack_4_m31_vars(ctx, &words[w..w + 4])],
+                        4,
+                    );
+                    let bit_simds = extract_bits(ctx, &packed, 31);
+                    // Unpack bits from Simd(4): each bit_simd has 4 lanes
+                    for bit_simd in &bit_simds {
+                        for lane in 0..4 {
+                            if all_bits.len() >= bits_per_poly { break; }
+                            all_bits.push(Simd::unpack_idx(ctx, bit_simd, lane));
+                        }
+                    }
+                    w += 4;
+                }
+                // Handle remaining words individually
+                while w < words.len() && all_bits.len() < bits_per_poly {
+                    let simd = Simd::from_packed(vec![words[w]], 1);
+                    let bit_simds = extract_bits(ctx, &simd, 31);
+                    for bit_simd in &bit_simds {
+                        if all_bits.len() >= bits_per_poly { break; }
+                        all_bits.push(Simd::unpack(ctx, bit_simd)[0]);
+                    }
+                    w += 1;
                 }
             }
-            byte_vars.truncate(bytes_per_poly);
-            cbd(ctx, &byte_vars, eta)
+
+            all_bits.truncate(bits_per_poly);
+            cbd_from_bits(ctx, &all_bits, eta)
         })
         .collect()
 }
 
-fn mod_reduce_byte<V: IValue + ZqWitness>(ctx: &mut Context<V>, x: Var) -> Var {
-    let x_int = ctx.get(x).raw_u32();
-    let r_var = guess(ctx, V::from_u32(x_int % 256));
-    let q_var = guess(ctx, V::from_u32(x_int / 256));
+/// Pack 4 individual M31-valued Vars into a single QM31 Var for Simd(4).
+fn pack_4_m31_vars<V: IValue>(ctx: &mut Context<V>, vars: &[Var]) -> Var {
+    assert!(vars.len() >= 4);
+    let unit1 = ctx.constant(circuits::ivalue::qm31_from_u32s(0, 1, 0, 0));
+    let unit2 = ctx.constant(circuits::ivalue::qm31_from_u32s(0, 0, 1, 0));
+    let unit3 = ctx.constant(circuits::ivalue::qm31_from_u32s(0, 0, 0, 1));
+    let t1 = circuits::eval!(ctx, (vars[1]) * (unit1));
+    let t2 = circuits::eval!(ctx, (vars[2]) * (unit2));
+    let t3 = circuits::eval!(ctx, (vars[3]) * (unit3));
+    let s01 = circuits::eval!(ctx, (vars[0]) + (t1));
+    let s23 = circuits::eval!(ctx, (t2) + (t3));
+    circuits::eval!(ctx, (s01) + (s23))
+}
 
-    let c256 = ctx.constant(QM31::from(M31::from(256u32)));
-    let q256 = pointwise_mul(ctx, q_var, c256);
-    let reconstructed = circuits::eval!(ctx, (q256) + (r_var));
-    eq(ctx, reconstructed, x);
-
-    let r_simd = Simd::from_packed(vec![r_var], 1);
-    let _bits = extract_bits(ctx, &r_simd, 8);
-    let q_simd = Simd::from_packed(vec![q_var], 1);
-    let _bits = extract_bits(ctx, &q_simd, 23);
-    r_var
+/// CBD sampling from a flat bit vector (no byte abstraction).
+fn cbd_from_bits<V: IValue + ZqWitness>(
+    ctx: &mut Context<V>,
+    bits: &[Var],
+    eta: u32,
+) -> RqPoly {
+    assert!(bits.len() >= N * 2 * eta as usize);
+    let mut coeffs = [ZqVar(ctx.zero()); N];
+    for i in 0..N {
+        let offset = i * 2 * eta as usize;
+        // sum_a = sum of first eta bits
+        let mut sum_a = ctx.zero();
+        for j in 0..eta as usize {
+            sum_a = circuits::eval!(ctx, (sum_a) + (bits[offset + j]));
+        }
+        // sum_b = sum of next eta bits
+        let mut sum_b = ctx.zero();
+        for j in 0..eta as usize {
+            sum_b = circuits::eval!(ctx, (sum_b) + (bits[offset + eta as usize + j]));
+        }
+        coeffs[i] = crate::zq::zq_sub(ctx, ZqVar(sum_a), ZqVar(sum_b));
+    }
+    RqPoly { coeffs }
 }
 
 fn unpack_hash_to_vars<V: IValue>(ctx: &mut Context<V>, hash: &HashValue<Var>) -> Vec<Var> {

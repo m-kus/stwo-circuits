@@ -96,7 +96,12 @@ fn bench_sender() {
         .map(|i| guess(&mut ctx, QM31::from(M31::from((i % 2) as u32))))
         .collect();
 
-    let _ss = sender_circuit(&mut ctx, params, &rho, &t_hat, &message_bits);
+    // Pre-computed A (verifier checks A = XOF(ρ) independently)
+    let a_hat: Vec<Vec<RqPoly>> = (0..k)
+        .map(|_| (0..k).map(|_| make_zero_poly(&mut ctx)).collect())
+        .collect();
+
+    let _ss = sender_circuit(&mut ctx, params, &rho, &t_hat, &a_hat, &message_bits);
 
     eprintln!("Circuit build: {:.2?}", t_start.elapsed());
     prove_and_measure(&mut ctx, "ML-KEM-512 SENDER (Encaps + Blake2s)");

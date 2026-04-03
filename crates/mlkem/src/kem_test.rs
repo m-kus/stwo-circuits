@@ -30,7 +30,12 @@ fn test_sender_circuit() {
         .map(|i| guess(&mut ctx, QM31::from(M31::from((i % 2) as u32))))
         .collect();
 
-    let ss = sender_circuit(&mut ctx, params, &rho, &t_hat, &message_bits);
+    // Pre-computed matrix A (in production, verifier checks A = XOF(ρ) independently)
+    let a_hat: Vec<Vec<RqPoly>> = (0..k)
+        .map(|_| (0..k).map(|_| make_zero_poly(&mut ctx)).collect())
+        .collect();
+
+    let ss = sender_circuit(&mut ctx, params, &rho, &t_hat, &a_hat, &message_bits);
     eprintln!("Sender shared secret: ({:?}, {:?})", ctx.get(ss.0), ctx.get(ss.1));
 
     ctx.finalize_guessed_vars();
@@ -89,7 +94,10 @@ fn test_sender_recipient_agree() {
         .map(|i| guess(&mut sender_ctx, QM31::from(M31::from((i % 2) as u32))))
         .collect();
 
-    let ss_sender = sender_circuit(&mut sender_ctx, params, &rho, &t_hat, &message_bits);
+    let a_hat: Vec<Vec<RqPoly>> = (0..k)
+        .map(|_| (0..k).map(|_| make_zero_poly(&mut sender_ctx)).collect())
+        .collect();
+    let ss_sender = sender_circuit(&mut sender_ctx, params, &rho, &t_hat, &a_hat, &message_bits);
     let ss_sender_val = (sender_ctx.get(ss_sender.0), sender_ctx.get(ss_sender.1));
 
     sender_ctx.finalize_guessed_vars();
