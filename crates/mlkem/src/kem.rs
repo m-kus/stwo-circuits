@@ -7,12 +7,12 @@ use circuits::simd::Simd;
 use stwo::core::fields::m31::M31;
 use stwo::core::fields::qm31::QM31;
 
-use crate::compress::compress;
-use crate::constants::N;
+use crate::compress::{compress, compress_batch4};
+use crate::constants::{N, Q};
 use crate::hash::{hash_g, hash_h, prf};
 use crate::ntt::{RqPoly, inv_ntt, ntt};
 use crate::poly::{inner_product_ntt, matrix_vec_mul_ntt, poly_add, poly_sub};
-use crate::zq::{ZqVar, ZqWitness, mod_reduce_lazy};
+use crate::zq::{ZqVar, ZqWitness, mod_reduce_lazy, mod_reduce_lazy_batch4};
 
 #[cfg(test)]
 #[path = "kem_test.rs"]
@@ -153,12 +153,24 @@ pub fn recipient_circuit<V: IValue + ZqWitness>(
     let mut inner = inner_product_ntt(ctx, s_hat, &u_ntt);
     inv_ntt(ctx, &mut inner);
     let w = poly_sub(ctx, v, &inner);
-    let message_bits: Vec<Var> = (0..N)
-        .map(|i| {
-            let reduced = mod_reduce_lazy(ctx, w.coeffs[i].0, 14);
-            compress(ctx, reduced, 1)
-        })
-        .collect();
+
+    // Batch mod_reduce + compress in groups of 4
+    let mut message_bits = vec![ctx.zero(); N];
+    let mut i = 0;
+    while i + 3 < N {
+        let vars: [Var; 4] = std::array::from_fn(|j| w.coeffs[i + j].0);
+        let reduced = mod_reduce_lazy_batch4(ctx, vars, 14);
+        let compressed = compress_batch4(ctx, reduced, 1);
+        for j in 0..4 {
+            message_bits[i + j] = compressed[j];
+        }
+        i += 4;
+    }
+    while i < N {
+        let reduced = mod_reduce_lazy(ctx, w.coeffs[i].0, 14);
+        message_bits[i] = compress(ctx, reduced, 1);
+        i += 1;
+    }
 
     // Re-derive shared secret: G(m' || H(pk)) → (K, _)
     let h_pk = hash_h(ctx, rho);
@@ -263,26 +275,54 @@ fn pack_4_m31_vars<V: IValue>(ctx: &mut Context<V>, vars: &[Var]) -> Var {
 }
 
 /// CBD sampling from a flat bit vector (no byte abstraction).
+/// Uses batch-4 subtraction for the a-b mod Q step.
 fn cbd_from_bits<V: IValue + ZqWitness>(
     ctx: &mut Context<V>,
     bits: &[Var],
     eta: u32,
 ) -> RqPoly {
+    use crate::zq::mod_reduce_lazy_batch4;
+
     assert!(bits.len() >= N * 2 * eta as usize);
     let mut coeffs = [ZqVar(ctx.zero()); N];
-    for i in 0..N {
-        let offset = i * 2 * eta as usize;
-        // sum_a = sum of first eta bits
+
+    // Compute all sum_a - sum_b differences, then batch-reduce in groups of 4.
+    let offset_const = ctx.constant(QM31::from(M31::from(2 * Q)));
+    let mut i = 0;
+    while i + 3 < N {
+        let mut diffs = [ctx.zero(); 4];
+        for idx in 0..4 {
+            let bit_offset = (i + idx) * 2 * eta as usize;
+            let mut sum_a = ctx.zero();
+            for j in 0..eta as usize {
+                sum_a = circuits::eval!(ctx, (sum_a) + (bits[bit_offset + j]));
+            }
+            let mut sum_b = ctx.zero();
+            for j in 0..eta as usize {
+                sum_b = circuits::eval!(ctx, (sum_b) + (bits[bit_offset + eta as usize + j]));
+            }
+            // diff = sum_a + 2Q - sum_b (prevents underflow)
+            diffs[idx] = circuits::eval!(ctx, ((sum_a) + (offset_const)) - (sum_b));
+        }
+        let results = mod_reduce_lazy_batch4(ctx, diffs, 14);
+        for idx in 0..4 {
+            coeffs[i + idx] = results[idx];
+        }
+        i += 4;
+    }
+    // Handle remaining coefficients individually
+    while i < N {
+        let bit_offset = i * 2 * eta as usize;
         let mut sum_a = ctx.zero();
         for j in 0..eta as usize {
-            sum_a = circuits::eval!(ctx, (sum_a) + (bits[offset + j]));
+            sum_a = circuits::eval!(ctx, (sum_a) + (bits[bit_offset + j]));
         }
-        // sum_b = sum of next eta bits
         let mut sum_b = ctx.zero();
         for j in 0..eta as usize {
-            sum_b = circuits::eval!(ctx, (sum_b) + (bits[offset + eta as usize + j]));
+            sum_b = circuits::eval!(ctx, (sum_b) + (bits[bit_offset + eta as usize + j]));
         }
         coeffs[i] = crate::zq::zq_sub(ctx, ZqVar(sum_a), ZqVar(sum_b));
+        i += 1;
     }
     RqPoly { coeffs }
 }
